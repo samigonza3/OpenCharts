@@ -63,6 +63,6 @@ describe("portfolio adapter", () => {
     expect((await md.getSymbols()).some((s) => s.name === "SOXX")).toBe(true);
     expect(await md.getCandles({ symbol: "SOXX", timeframe: "1d" })).toHaveLength(2);
     const quote = await md.getQuote!("SOXX");
-    expect(quote?.bid).toBe(101);
+    expect(quote?.bid).toBe(3.5);
   });
 });

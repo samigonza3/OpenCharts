@@ -1,9 +1,9 @@
 diff --git a/examples/portfolio-adapter/portfolio-adapter.ts b/examples/portfolio-adapter/portfolio-adapter.ts
 new file mode 100644
-index 0000000..312486b
+index 0000000..6c084f8
 --- /dev/null
 +++ b/examples/portfolio-adapter/portfolio-adapter.ts
-@@ -0,0 +1,277 @@
+@@ -0,0 +1,337 @@
 +import type {
 +  CandleRequest,
 +  ConnectionState,
@@ -24,8 +24,10 @@ index 0000000..312486b
 + * ticker as Yahoo writes it. Colombian stocks use the ".CL" suffix; confirm each
 + * one at finance.yahoo.com before relying on it.
 + *
-+ * Data is delayed (Yahoo, roughly 15 minutes for many exchanges) and refreshed
-+ * by polling, not a websocket. There is no trading: this is for looking at charts.
++ * Bitcoin streams live over Binance's websocket. Everything else comes from Yahoo,
++ * refreshed every 5 seconds by polling, including pre-market and after-hours bars
++ * on intraday charts. US stocks and ETFs are near real time; some other exchanges
++ * (for example Colombia) are delayed by Yahoo. No trading: this is for charts.
 + */
 +
 +export interface PortfolioItem {
@@ -43,7 +45,6 @@ index 0000000..312486b
 +  NU: { yahoo: "NU", label: "Nu Holdings", category: "STOCK" },
 +  PLTR: { yahoo: "PLTR", label: "Palantir", category: "STOCK" },
 +  AMD: { yahoo: "AMD", label: "AMD", category: "STOCK" },
-+  BTCUSD: { yahoo: "BTC-USD", label: "Bitcoin", category: "CRYPTO" },
 +  USDCOP: { yahoo: "COP=X", label: "USD/COP", category: "FX" },
 +  EURCOP: { yahoo: "EURCOP=X", label: "EUR/COP", category: "FX" },
 +  BRENT: { yahoo: "BZ=F", label: "Brent", category: "COMMODITY" },
@@ -55,7 +56,11 @@ index 0000000..312486b
 +};
 +
 +const ENDPOINT = "/api/yahoo";
-+const POLL_MS = 20_000;
++const POLL_MS = 5_000;
++const MAX_POLLED = 10;
++
++/** Symbols served live by Binance's websocket instead of Yahoo. */
++export const BINANCE_SYMBOLS = ["BTCUSD"];
 +
 +/** OpenCharts timeframe → Yahoo interval, default range, and bars to merge. */
 +const TF: Record<string, { interval: string; range: string; merge: number }> = {
@@ -187,19 +192,21 @@ index 0000000..312486b
 +  };
 +
 +  async function lastPrice(symbol: string): Promise<number | null> {
-+    const url = buildUrl({ symbol, timeframe: "1m" }, endpoint);
-+    if (!url) return null;
-+    const res = await doFetch(url);
++    const item = PORTFOLIO[symbol];
++    if (!item) return null;
++    // Last 1-minute bar of today, pre-market and after-hours included. Using the
++    // last bar (not regularMarketPrice) keeps the price moving before the open.
++    const params = new URLSearchParams({ symbol: item.yahoo, interval: "1m", range: "1d" });
++    const res = await doFetch(`${endpoint}?${params.toString()}`);
 +    if (!res.ok) return null;
 +    const payload = (await res.json()) as YahooChart;
-+    const price = payload.chart?.result?.[0]?.meta?.regularMarketPrice;
-+    if (price != null) return price;
 +    const bars = parseYahoo(payload);
-+    return bars.length ? bars[bars.length - 1]!.close : null;
++    if (bars.length) return bars[bars.length - 1]!.close;
++    return payload.chart?.result?.[0]?.meta?.regularMarketPrice ?? null;
 +  }
 +
 +  async function poll() {
-+    const targets = (interest.length ? interest : names).slice(0, 6);
++    const targets = (interest.length ? interest : names).slice(0, MAX_POLLED);
 +    let ok = false;
 +    await Promise.all(
 +      targets.map(async (symbol) => {
@@ -270,14 +277,67 @@ index 0000000..312486b
 +  };
 +}
 +
++function combine(yahoo: MarketDataSource, binance: MarketDataSource): MarketDataSource {
++  const isBinance = (symbol: string) => BINANCE_SYMBOLS.includes(symbol);
++  const pick = (symbol: string) => (isBinance(symbol) ? binance : yahoo);
++  const stateListeners = new Set<(s: ConnectionState) => void>();
++  const states: ConnectionState[] = ["disconnected", "disconnected"];
++  const merged = (): ConnectionState =>
++    states.includes("connected") ? "connected" : (states[0] ?? "disconnected");
++  const notify = () => {
++    for (const l of [...stateListeners]) l(merged());
++  };
++  yahoo.onConnectionChange?.((s) => {
++    states[0] = s;
++    notify();
++  });
++  binance.onConnectionChange?.((s) => {
++    states[1] = s;
++    notify();
++  });
++
++  return {
++    getSymbols: async () => [...(await binance.getSymbols()), ...(await yahoo.getSymbols())],
++    getCandles: (request) => pick(request.symbol).getCandles(request),
++    getQuote: (symbol) => pick(symbol).getQuote?.(symbol) ?? Promise.resolve(null),
++    subscribe: (handler) => {
++      const offs = [yahoo.subscribe(handler), binance.subscribe(handler)];
++      return () => offs.forEach((off) => off());
++    },
++    connect: () => {
++      void yahoo.connect?.();
++      void binance.connect?.();
++    },
++    disconnect: () => {
++      yahoo.disconnect?.();
++      binance.disconnect?.();
++    },
++    getConnectionState: merged,
++    onConnectionChange: (listener) => {
++      stateListeners.add(listener);
++      listener(merged());
++      return () => stateListeners.delete(listener);
++    },
++    setSymbolInterest: (symbols) => {
++      yahoo.setSymbolInterest?.(symbols.filter((x) => !isBinance(x)));
++    },
++  };
++}
++
 +/** Read-only: charts and watchlist only, no paper trading. */
 +export async function createPortfolioAdapter(
 +  options: PortfolioOptions = {},
 +): Promise<OpenChartsAdapter> {
-+  const { createDemoAdapter } = await import("../../src/adapter/demo.ts");
++  const [{ createDemoAdapter }, { createBinanceMarketData }] = await Promise.all([
++    import("../../src/adapter/demo.ts"),
++    import("../binance-adapter/binance-adapter.ts"),
++  ]);
 +  return {
-+    name: "portfolio-yahoo",
-+    marketData: createPortfolioMarketData(options),
++    name: "portfolio-yahoo-binance",
++    marketData: combine(
++      createPortfolioMarketData(options),
++      createBinanceMarketData({ symbols: BINANCE_SYMBOLS }),
++    ),
 +    storage: createDemoAdapter().storage,
 +  };
 +}
@@ -295,10 +355,10 @@ index 0000000..51d668e
 +  directory = "netlify/functions"
 diff --git a/netlify/functions/yahoo.mjs b/netlify/functions/yahoo.mjs
 new file mode 100644
-index 0000000..4bf03bf
+index 0000000..bc25a0c
 --- /dev/null
 +++ b/netlify/functions/yahoo.mjs
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,52 @@
 +// Proxy to Yahoo Finance's chart endpoint.
 +// Browsers cannot call Yahoo directly (CORS), so the terminal calls this
 +// function instead: GET /api/yahoo?symbol=SOXX&interval=1d&range=1y
@@ -328,7 +388,9 @@ index 0000000..4bf03bf
 +  if (!SYMBOL_RE.test(symbol)) return json({ error: "invalid symbol" }, 400);
 +  if (!INTERVALS.has(interval)) return json({ error: "invalid interval" }, 400);
 +
-+  const params = new URLSearchParams({ interval, includePrePost: "false" });
++  // Pre-market and after-hours bars are included for intraday intervals.
++  const intraday = interval !== "1d" && interval !== "1wk";
++  const params = new URLSearchParams({ interval, includePrePost: intraday ? "true" : "false" });
 +  if (period1 && period2 && /^\d+$/.test(period1) && /^\d+$/.test(period2)) {
 +    params.set("period1", period1);
 +    params.set("period2", period2);
@@ -345,7 +407,7 @@ index 0000000..4bf03bf
 +  if (!upstream.ok) return json({ error: `yahoo ${upstream.status}` }, 502);
 +
 +  // Short cache so scroll-back and polling do not hammer Yahoo.
-+  return json(await upstream.json(), 200, interval.endsWith("m") ? 10 : 60);
++  return json(await upstream.json(), 200, interval.endsWith("m") ? 3 : 60);
 +};
 +
 +export const config = { path: "/api/yahoo" };
@@ -381,7 +443,7 @@ index 906c009..d17c809 100644
      import("../examples/binance-adapter/binance-adapter.ts")
 diff --git a/src/__tests__/portfolio-adapter.test.ts b/src/__tests__/portfolio-adapter.test.ts
 new file mode 100644
-index 0000000..8b2e846
+index 0000000..fb8b148
 --- /dev/null
 +++ b/src/__tests__/portfolio-adapter.test.ts
 @@ -0,0 +1,68 @@
@@ -450,6 +512,6 @@ index 0000000..8b2e846
 +    expect((await md.getSymbols()).some((s) => s.name === "SOXX")).toBe(true);
 +    expect(await md.getCandles({ symbol: "SOXX", timeframe: "1d" })).toHaveLength(2);
 +    const quote = await md.getQuote!("SOXX");
-+    expect(quote?.bid).toBe(101);
++    expect(quote?.bid).toBe(3.5);
 +  });
 +});

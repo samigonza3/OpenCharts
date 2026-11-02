@@ -27,7 +27,9 @@ export default async (req) => {
   if (!SYMBOL_RE.test(symbol)) return json({ error: "invalid symbol" }, 400);
   if (!INTERVALS.has(interval)) return json({ error: "invalid interval" }, 400);
 
-  const params = new URLSearchParams({ interval, includePrePost: "false" });
+  // Pre-market and after-hours bars are included for intraday intervals.
+  const intraday = interval !== "1d" && interval !== "1wk";
+  const params = new URLSearchParams({ interval, includePrePost: intraday ? "true" : "false" });
   if (period1 && period2 && /^\d+$/.test(period1) && /^\d+$/.test(period2)) {
     params.set("period1", period1);
     params.set("period2", period2);
@@ -44,7 +46,7 @@ export default async (req) => {
   if (!upstream.ok) return json({ error: `yahoo ${upstream.status}` }, 502);
 
   // Short cache so scroll-back and polling do not hammer Yahoo.
-  return json(await upstream.json(), 200, interval.endsWith("m") ? 10 : 60);
+  return json(await upstream.json(), 200, interval.endsWith("m") ? 3 : 60);
 };
 
 export const config = { path: "/api/yahoo" };

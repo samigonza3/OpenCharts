@@ -18,8 +18,10 @@ import type { Candle, Symbol } from "../../src/services/schemas.ts";
  * ticker as Yahoo writes it. Colombian stocks use the ".CL" suffix; confirm each
  * one at finance.yahoo.com before relying on it.
  *
- * Data is delayed (Yahoo, roughly 15 minutes for many exchanges) and refreshed
- * by polling, not a websocket. There is no trading: this is for looking at charts.
+ * Bitcoin streams live over Binance's websocket. Everything else comes from Yahoo,
+ * refreshed every 5 seconds by polling, including pre-market and after-hours bars
+ * on intraday charts. US stocks and ETFs are near real time; some other exchanges
+ * (for example Colombia) are delayed by Yahoo. No trading: this is for charts.
  */
 
 export interface PortfolioItem {
@@ -37,7 +39,6 @@ export const PORTFOLIO: Record<string, PortfolioItem> = {
   NU: { yahoo: "NU", label: "Nu Holdings", category: "STOCK" },
   PLTR: { yahoo: "PLTR", label: "Palantir", category: "STOCK" },
   AMD: { yahoo: "AMD", label: "AMD", category: "STOCK" },
-  BTCUSD: { yahoo: "BTC-USD", label: "Bitcoin", category: "CRYPTO" },
   USDCOP: { yahoo: "COP=X", label: "USD/COP", category: "FX" },
   EURCOP: { yahoo: "EURCOP=X", label: "EUR/COP", category: "FX" },
   BRENT: { yahoo: "BZ=F", label: "Brent", category: "COMMODITY" },
@@ -49,7 +50,11 @@ export const PORTFOLIO: Record<string, PortfolioItem> = {
 };
 
 const ENDPOINT = "/api/yahoo";
-const POLL_MS = 20_000;
+const POLL_MS = 5_000;
+const MAX_POLLED = 10;
+
+/** Symbols served live by Binance's websocket instead of Yahoo. */
+export const BINANCE_SYMBOLS = ["BTCUSD"];
 
 /** OpenCharts timeframe → Yahoo interval, default range, and bars to merge. */
 const TF: Record<string, { interval: string; range: string; merge: number }> = {
@@ -181,19 +186,21 @@ export function createPortfolioMarketData(options: PortfolioOptions = {}): Marke
   };
 
   async function lastPrice(symbol: string): Promise<number | null> {
-    const url = buildUrl({ symbol, timeframe: "1m" }, endpoint);
-    if (!url) return null;
-    const res = await doFetch(url);
+    const item = PORTFOLIO[symbol];
+    if (!item) return null;
+    // Last 1-minute bar of today, pre-market and after-hours included. Using the
+    // last bar (not regularMarketPrice) keeps the price moving before the open.
+    const params = new URLSearchParams({ symbol: item.yahoo, interval: "1m", range: "1d" });
+    const res = await doFetch(`${endpoint}?${params.toString()}`);
     if (!res.ok) return null;
     const payload = (await res.json()) as YahooChart;
-    const price = payload.chart?.result?.[0]?.meta?.regularMarketPrice;
-    if (price != null) return price;
     const bars = parseYahoo(payload);
-    return bars.length ? bars[bars.length - 1]!.close : null;
+    if (bars.length) return bars[bars.length - 1]!.close;
+    return payload.chart?.result?.[0]?.meta?.regularMarketPrice ?? null;
   }
 
   async function poll() {
-    const targets = (interest.length ? interest : names).slice(0, 6);
+    const targets = (interest.length ? interest : names).slice(0, MAX_POLLED);
     let ok = false;
     await Promise.all(
       targets.map(async (symbol) => {
@@ -264,14 +271,67 @@ export function createPortfolioMarketData(options: PortfolioOptions = {}): Marke
   };
 }
 
+function combine(yahoo: MarketDataSource, binance: MarketDataSource): MarketDataSource {
+  const isBinance = (symbol: string) => BINANCE_SYMBOLS.includes(symbol);
+  const pick = (symbol: string) => (isBinance(symbol) ? binance : yahoo);
+  const stateListeners = new Set<(s: ConnectionState) => void>();
+  const states: ConnectionState[] = ["disconnected", "disconnected"];
+  const merged = (): ConnectionState =>
+    states.includes("connected") ? "connected" : (states[0] ?? "disconnected");
+  const notify = () => {
+    for (const l of [...stateListeners]) l(merged());
+  };
+  yahoo.onConnectionChange?.((s) => {
+    states[0] = s;
+    notify();
+  });
+  binance.onConnectionChange?.((s) => {
+    states[1] = s;
+    notify();
+  });
+
+  return {
+    getSymbols: async () => [...(await binance.getSymbols()), ...(await yahoo.getSymbols())],
+    getCandles: (request) => pick(request.symbol).getCandles(request),
+    getQuote: (symbol) => pick(symbol).getQuote?.(symbol) ?? Promise.resolve(null),
+    subscribe: (handler) => {
+      const offs = [yahoo.subscribe(handler), binance.subscribe(handler)];
+      return () => offs.forEach((off) => off());
+    },
+    connect: () => {
+      void yahoo.connect?.();
+      void binance.connect?.();
+    },
+    disconnect: () => {
+      yahoo.disconnect?.();
+      binance.disconnect?.();
+    },
+    getConnectionState: merged,
+    onConnectionChange: (listener) => {
+      stateListeners.add(listener);
+      listener(merged());
+      return () => stateListeners.delete(listener);
+    },
+    setSymbolInterest: (symbols) => {
+      yahoo.setSymbolInterest?.(symbols.filter((x) => !isBinance(x)));
+    },
+  };
+}
+
 /** Read-only: charts and watchlist only, no paper trading. */
 export async function createPortfolioAdapter(
   options: PortfolioOptions = {},
 ): Promise<OpenChartsAdapter> {
-  const { createDemoAdapter } = await import("../../src/adapter/demo.ts");
+  const [{ createDemoAdapter }, { createBinanceMarketData }] = await Promise.all([
+    import("../../src/adapter/demo.ts"),
+    import("../binance-adapter/binance-adapter.ts"),
+  ]);
   return {
-    name: "portfolio-yahoo",
-    marketData: createPortfolioMarketData(options),
+    name: "portfolio-yahoo-binance",
+    marketData: combine(
+      createPortfolioMarketData(options),
+      createBinanceMarketData({ symbols: BINANCE_SYMBOLS }),
+    ),
     storage: createDemoAdapter().storage,
   };
 }
